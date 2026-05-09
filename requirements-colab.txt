@@ -1,0 +1,7 @@
+# Minimal deps for `scripts/train_intent.py` and the data-pipeline scripts.
+# Use this on Colab — it skips MediaPipe/OpenCV/Ultralytics/CARLA which the
+# training path never imports.
+numpy>=1.21.0
+torch>=2.1.0
+scikit-learn>=1.3.0
+matplotlib>=3.7.0
