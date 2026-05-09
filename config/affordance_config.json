@@ -1,0 +1,19 @@
+{
+  "affordance_mapping": {
+    "person":        "Caution",
+    "pedestrian":    "Caution",
+    "bicycle":       "Caution",
+    "motorcycle":    "Caution",
+    "traffic light": "Instructional",
+    "stop sign":     "Instructional",
+    "car":           "Constraint",
+    "truck":         "Constraint",
+    "bus":           "Constraint",
+    "merging_gap":   "Opportunity"
+  },
+  "distance_thresholds": {
+    "critical": 5,
+    "high":     15,
+    "medium":   30
+  }
+}

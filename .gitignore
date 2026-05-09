@@ -1,0 +1,91 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+develop-eggs/
+.installed.cfg
+MANIFEST
+pip-log.txt
+pip-delete-this-directory.txt
+
+# --- Virtual environments ---
+.venv/
+.venv311/
+venv/
+env/
+ENV/
+.python-version
+
+# --- IDE / editors / tool caches ---
+.vscode/
+.idea/
+.code-review-graph/
+.claude/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# --- Testing / coverage ---
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+
+# --- Type checkers / linters ---
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.dmypy.json
+
+# --- Project: runtime artefacts ---
+logs/
+runs/
+reports/
+data/
+calibration/
+*.log
+
+# --- Project: model weights / checkpoints ---
+models/
+*.pth
+*.pt
+*.onnx
+*.engine
+*.ckpt
+# keep the small bundled YOLO weights tracked
+!yolov8n.pt
+
+# --- Project: simulator / datasets (large, machine-local) ---
+CARLA*/
+*.zip
+*.tar
+*.tar.gz
+*.7z
+
+# --- Secrets / local config ---
+.env
+.env.*
+!.env.example
+*.local.json
+secrets.json
+
+# --- OS / misc ---
+*.tmp
+*.bak
+*.orig
