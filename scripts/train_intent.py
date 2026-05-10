@@ -722,11 +722,19 @@ def train_kfold(args):
     print("  Best model (val_acc={:.1f}%) saved -> {:s}".format(
         global_best_val_acc, str(ckpt_path)))
 
-    for fi in range(args.n_folds):
-        p = out_dir / '{:s}_fold{:d}{:s}'.format(ckpt_stem, fi, ckpt_suffix)
-        if p.exists():
-            p.unlink()
-    print("  Per-fold checkpoints removed.")
+    if not getattr(args, 'keep_folds', False):
+        for fi in range(args.n_folds):
+            p = out_dir / '{:s}_fold{:d}{:s}'.format(ckpt_stem, fi, ckpt_suffix)
+            if p.exists():
+                p.unlink()
+        print("  Per-fold checkpoints removed.")
+    else:
+        kept = [out_dir / '{:s}_fold{:d}{:s}'.format(ckpt_stem, fi, ckpt_suffix)
+                for fi in range(args.n_folds)]
+        kept = [p for p in kept if p.exists()]
+        print("  Kept {:d} per-fold checkpoints for ensembling:".format(len(kept)))
+        for p in kept:
+            print("    {:s}".format(str(p)))
 
 
 # ── Evaluate ─────────────────────────────────────────────────────────────────
@@ -865,6 +873,8 @@ def main():
                     help='Use telemetry-aware augmentation (modules.feature_augment)')
     kf.add_argument('--use-weak-weights', action='store_true', dest='use_weak_weights',
                     help='Read consensus_confidence from weak_label_meta as sample weight')
+    kf.add_argument('--keep-folds',   action='store_true', dest='keep_folds',
+                    help='Preserve per-fold checkpoints for ensembling')
 
     # ── evaluate ────────────────────────────────────────────────────────────
     ev = sub.add_parser('evaluate')
