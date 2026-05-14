@@ -119,7 +119,7 @@ class TemporalIntentModel(nn.Module):
     def __init__(
         self,
         input_size: int = FEATURE_DIM,
-        stream_hidden: int = 64,
+        stream_hidden: int = 128,
         num_layers: int = 2,
         num_heads: int = 4,            # kept for call-site compat, unused
         num_classes: int = len(INTENT_CLASSES),

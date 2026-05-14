@@ -215,9 +215,9 @@ def pick_mode_interactive() -> str:
 
 
 def _default_driver(indices: List[int]) -> int:
-    """Prefer camera index 1 for the driver-facing cam; fall back if absent."""
-    if 1 in indices:
-        return 1
+    """Prefer camera index 0 for the driver-facing cam; fall back if absent."""
+    if 0 in indices:
+        return 0
     return indices[0]
 
 
@@ -236,17 +236,26 @@ def configure_two_cam() -> dict:
     return {'sim': 'none', 'driver': driver, 'scene': scene}
 
 
-def configure_metadrive() -> dict:
+def configure_metadrive(quick: bool = False,
+                        manual_arg: bool = False) -> dict:
     cams = discover_cameras()
     if not cams:
         print("\nERROR: No driver-facing camera detected.")
         sys.exit(1)
     indices = [c[0] for c in cams]
     print()
-    driver = _ask_int("Driver-cam index", _default_driver(indices),
-                      allowed=indices)
-    manual = _ask_yesno("Drive the simulator manually (keyboard)?",
-                        default_yes=False)
+    if quick:
+        # No prompts: auto-pick the driver-facing camera and use whatever
+        # value --manual was set to on the command line.
+        driver = _default_driver(indices)
+        manual = manual_arg
+        print(f"[Launcher] --quick: driver-cam={driver}, "
+              f"manual={'yes' if manual else 'no'}")
+    else:
+        driver = _ask_int("Driver-cam index", _default_driver(indices),
+                          allowed=indices)
+        manual = _ask_yesno("Drive the simulator manually (keyboard)?",
+                            default_yes=manual_arg)
     return {'sim': 'metadrive', 'driver': driver, 'scene': driver,
             'manual': manual}
 
@@ -353,6 +362,10 @@ def main() -> None:
     parser.add_argument('--carla-port', default=2000, type=int)
     parser.add_argument('--manual', action='store_true',
                         help='MetaDrive: manual keyboard control')
+    parser.add_argument('--quick', action='store_true',
+                        help='Skip all interactive prompts (auto-pick '
+                             'driver cam, no calibration offer). For '
+                             'one-click demo mode from RUN.bat.')
     parser.add_argument('--model', default=None,
                         help='Intent model checkpoint (auto-detected if omitted)')
     parser.add_argument('--no-voice', action='store_true',
@@ -368,8 +381,9 @@ def main() -> None:
     if mode == 'calibrate':
         return sys.exit(run_calibration_flow())
 
-    # Offer camera calibration before each run
-    maybe_offer_calibration()
+    # Offer camera calibration before each run (skipped in --quick mode)
+    if not args.quick:
+        maybe_offer_calibration()
 
     # 2. Build configuration (CLI args override interactive prompts)
     if args.driver is not None:
@@ -387,7 +401,11 @@ def main() -> None:
             cfg['carla_host'] = args.carla_host or 'localhost'
             cfg['carla_port'] = args.carla_port
     else:
-        cfg = _CONFIGURERS[mode]()
+        if mode == 'metadrive':
+            cfg = configure_metadrive(quick=args.quick,
+                                       manual_arg=args.manual)
+        else:
+            cfg = _CONFIGURERS[mode]()
 
     # 3. Trained model auto-discovery
     model_path = args.model
@@ -396,7 +414,10 @@ def main() -> None:
     else:
         model_path = find_latest_model()
         if model_path:
-            print(f"\n[Launcher] Using intent model: {model_path}")
+            mb = Path(model_path).stat().st_size / 1e6
+            print(f"\n[Launcher] Loaded intent model: "
+                  f"{Path(model_path).name} ({mb:.1f} MB)")
+            print(f"[Launcher]   path: {model_path}")
         else:
             print("\n[Launcher] No compatible intent model in models/. "
                   "Running in rule-based mode.")

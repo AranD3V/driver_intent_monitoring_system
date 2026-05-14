@@ -17,6 +17,8 @@ Usage:
     capture.release()
 """
 
+import math
+import re
 import sys
 import time
 import threading
@@ -24,6 +26,27 @@ import numpy as np
 import cv2
 from queue import Queue, Empty
 from typing import Optional, Tuple
+
+
+# ── Traffic-light cycle constants ────────────────────────────────────── #
+TL_GREEN_S  = 8.0
+TL_YELLOW_S = 2.0
+TL_RED_S    = 8.0
+TL_PERIOD_S = TL_GREEN_S + TL_YELLOW_S + TL_RED_S   # 18s
+
+# How far ahead (m) we look for an upcoming light, and the max lateral
+# offset from the ego heading we still consider "in our lane".
+TL_LOOKAHEAD_M     = 60.0
+TL_LATERAL_TOL_M   = 8.0
+
+
+def _light_status_label(status: str) -> str:
+    """Maps MetaDriveType.LIGHT_* string constants to short labels."""
+    s = (status or '').lower()
+    if 'green'  in s: return 'green'
+    if 'yellow' in s: return 'yellow'
+    if 'red'    in s: return 'red'
+    return 'unknown'
 
 
 # ------------------------------------------------------------------ #
@@ -77,6 +100,179 @@ class _DriverThread(threading.Thread):
     def stop(self):
         self._running = False
         self._cap.release()
+
+
+# ------------------------------------------------------------------ #
+#  Traffic-light controller                                            #
+# ------------------------------------------------------------------ #
+
+class _TrafficLightController:
+    """
+    Spawns one BaseTrafficLight per approach lane at every intersection
+    block (X / T / Roundabout / Y-junction) in the current map, then cycles
+    each light through green->yellow->red on a fixed schedule with a phase
+    offset per arm so opposing arms aren't both green at once.
+
+    All methods MUST be called from the main thread (same Panda3D rule
+    that applies to env.step()).
+    """
+
+    _INTERSECTION_MARKERS = (
+        'InterSection', 'Intersection', 'TInter',
+        'Round', 'YJunction', 'Junction',
+    )
+
+    def __init__(self, env):
+        from metadrive.component.traffic_light.base_traffic_light import BaseTrafficLight
+        self._env = env
+        # List of dicts: {'light', 'lane', 'phase_offset_s', 'block_idx'}
+        self._lights = []
+        self._t0 = time.time()
+        self._BaseTL = BaseTrafficLight
+        self._spawn_all()
+
+    # ------------------------------------------------------------------ #
+
+    def _spawn_all(self):
+        try:
+            blocks = self._env.current_map.blocks
+            graph  = self._env.current_map.road_network.graph
+        except Exception as e:
+            print(f"[TrafficLight] Could not read map: {e}")
+            return
+
+        # Which block indices are intersections?
+        intersection_blocks = {}
+        for blk in blocks:
+            name = type(blk).__name__
+            if any(m in name for m in self._INTERSECTION_MARKERS):
+                intersection_blocks[getattr(blk, 'block_index', -1)] = name
+
+        if not intersection_blocks:
+            print("[TrafficLight] No intersection blocks in this map.")
+            return
+
+        # Approach lanes: lanes whose to-node sits inside an intersection
+        # block AND whose from-node belongs to a different block.
+        def _node_block_idx(n: str) -> Optional[int]:
+            m = re.match(r'^-?(\d+)', n)
+            return int(m.group(1)) if m else None
+
+        approaches: dict = {bi: [] for bi in intersection_blocks}
+        for frm in graph:
+            for to in graph[frm]:
+                from_bi = _node_block_idx(frm)
+                to_bi   = _node_block_idx(to)
+                if to_bi in intersection_blocks and from_bi != to_bi:
+                    lanes = graph[frm][to]
+                    if lanes:
+                        # Rightmost lane only — one light per approach arm.
+                        approaches[to_bi].append(lanes[0])
+
+        # Spawn lights with phase offsets so arms within the same
+        # intersection alternate (e.g. NS green when EW red).
+        spawned = 0
+        for bi, lanes in approaches.items():
+            n = max(len(lanes), 1)
+            half = TL_PERIOD_S / 2.0
+            for i, lane in enumerate(lanes):
+                try:
+                    light = self._env.engine.spawn_object(self._BaseTL, lane=lane)
+                except Exception as e:
+                    print(f"[TrafficLight] Spawn failed on block {bi}: {e}")
+                    continue
+                # Alternate phase between adjacent approach lanes
+                phase = (i % 2) * half
+                self._lights.append({
+                    'light':        light,
+                    'lane':         lane,
+                    'phase_offset_s': phase,
+                    'block_idx':    bi,
+                })
+                spawned += 1
+
+        if spawned:
+            print(f"[TrafficLight] Spawned {spawned} lights across "
+                  f"{len(intersection_blocks)} intersections "
+                  f"({list(intersection_blocks.values())}).")
+
+    # ------------------------------------------------------------------ #
+
+    def step(self) -> None:
+        """Advance each light's state machine. Called once per env.step()."""
+        if not self._lights:
+            return
+        now = time.time() - self._t0
+        for entry in self._lights:
+            t = (now + entry['phase_offset_s']) % TL_PERIOD_S
+            light = entry['light']
+            try:
+                if t < TL_GREEN_S:
+                    if 'GREEN' not in (light.status or ''):
+                        light.set_green()
+                elif t < TL_GREEN_S + TL_YELLOW_S:
+                    if 'YELLOW' not in (light.status or ''):
+                        light.set_yellow()
+                else:
+                    if 'RED' not in (light.status or ''):
+                        light.set_red()
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------ #
+
+    def find_nearest_ahead(self,
+                            ego_pos: Tuple[float, float],
+                            ego_heading: float) -> Optional[dict]:
+        """
+        Returns the closest light in front of the ego within TL_LOOKAHEAD_M:
+            {'state': 'red'|'yellow'|'green',
+             'distance_m': float,
+             'position': (x, y),
+             'light_id':  str}
+        or None when no light is upcoming.
+        """
+        if not self._lights:
+            return None
+        cos_h = math.cos(ego_heading)
+        sin_h = math.sin(ego_heading)
+        best = None
+        for entry in self._lights:
+            light = entry['light']
+            try:
+                lp = light.position
+                lx, ly = float(lp[0]), float(lp[1])
+            except Exception:
+                continue
+            dx = lx - ego_pos[0]
+            dy = ly - ego_pos[1]
+            ahead = dx * cos_h + dy * sin_h      # >0 = in front of ego
+            if ahead < -1.0:
+                continue
+            lateral = abs(-dx * sin_h + dy * cos_h)
+            if lateral > TL_LATERAL_TOL_M:
+                continue
+            dist = math.hypot(dx, dy)
+            if dist > TL_LOOKAHEAD_M:
+                continue
+            if best is None or dist < best['distance_m']:
+                best = {
+                    'state':      _light_status_label(light.status),
+                    'distance_m': round(dist, 2),
+                    'position':   (lx, ly),
+                    'light_id':   str(id(light)),
+                }
+        return best
+
+    # ------------------------------------------------------------------ #
+
+    def destroy(self):
+        for entry in self._lights:
+            try:
+                entry['light'].destroy()
+            except Exception:
+                pass
+        self._lights.clear()
 
 
 # ------------------------------------------------------------------ #
@@ -142,6 +338,28 @@ class MetaDriveCapture:
             "interface_panel":   [],
             "show_logo":         False,
             "traffic_density":   0.1,
+            # Richer map: a 7-block sequence with intersections, roundabouts
+            # and ramps -- so the sim labeler sees broken/solid/yellow lines,
+            # traffic cones, divided roads (for wrong-side detection), and
+            # right-of-way intersections within a single free-roam session.
+            # 'S' straight, 'C' curve, 'r'/'R' on-/off-ramp, 'X' 4-way,
+            # 'T' 3-way, 'O' roundabout, 'y' Y-junction.
+            "map":               "SCrRXTOC",
+            "accident_prob":     0.4,     # spawns cones + barriers on road
+            # ── Free-roam termination policy ─────────────────────────────
+            # The user wants the sim to keep running through violations and
+            # crashes -- the run only ends when they press q/Esc. So we
+            # disable every termination MetaDrive lets us disable. The two
+            # we can't disable (arrive_dest, crash_building) get caught in
+            # read() and trigger a silent in-place reset.
+            "out_of_road_done":        False,
+            "on_continuous_line_done": False,
+            "on_broken_line_done":     False,
+            "crash_vehicle_done":      False,
+            "crash_object_done":       False,
+            "crash_human_done":        False,
+            "horizon":                 None,
+            "truncate_as_terminate":   False,
         }
 
         if manual:
@@ -156,6 +374,19 @@ class MetaDriveCapture:
         self._obs, _ = self._env.reset()
         self._terminated = False
         self._running = True
+        # Last-step info dict (populated each read() so sim_labeler can
+        # read crash flags, steering, accel, navigation, etc).
+        self._last_info: dict = {}
+        # Spawn + cycle traffic lights at every intersection block in the
+        # current map. No-op if the map has no intersections.
+        try:
+            self._tl_controller = _TrafficLightController(self._env)
+        except Exception as e:
+            print(f"[MetaDriveCapture] Traffic-light setup failed: {e}")
+            self._tl_controller = None
+        # Cached nearest-light reading from the most recent read(), used by
+        # get_sim_state() so sim_labeler doesn't need to recompute it.
+        self._last_light_ahead: Optional[dict] = None
 
         if manual:
             print("[MetaDriveCapture] Ready: MetaDrive (manual control) + driver webcam.")
@@ -190,16 +421,61 @@ class MetaDriveCapture:
 
         # Gymnasium (5-tuple) vs old API (4-tuple)
         if len(step_result) == 5:
-            obs, _reward, terminated, truncated, _info = step_result
+            obs, _reward, terminated, truncated, info = step_result
             done = terminated or truncated
         else:
-            obs, _reward, done, _info = step_result
+            obs, _reward, done, info = step_result
+
+        # Cache for get_sim_state(); reset wipes it because the next info
+        # only arrives on the following step.
+        self._last_info = info if isinstance(info, dict) else {}
 
         if done:
+            # MetaDrive only forces termination on arrive_dest or
+            # crash_building (the two we cannot disable via config).
+            # Everything else -- vehicle crashes, off-road, line crossings,
+            # ego in oncoming lane -- keeps the run alive.
+            reason = ('arrive_dest' if info.get('arrive_dest')
+                      else 'crash_building' if info.get('crash_building')
+                      else 'unknown')
+            print(f"[MetaDriveCapture] Auto-reset (reason: {reason}) — "
+                  f"respawning ego, keeping run alive.")
             try:
+                # Lights must be destroyed BEFORE env.reset() — MetaDrive's
+                # base_engine asserts there are no leftover physics bodies
+                # when manager.reset() runs.
+                if self._tl_controller is not None:
+                    try:
+                        self._tl_controller.destroy()
+                    except Exception:
+                        pass
+                    self._tl_controller = None
                 obs, _ = self._env.reset()
-            except Exception:
-                pass
+                self._last_info = {}
+                # Re-spawn into the freshly-reset map.
+                try:
+                    self._tl_controller = _TrafficLightController(self._env)
+                except Exception as e:
+                    print(f"[MetaDriveCapture] TL re-spawn failed: {e}")
+                    self._tl_controller = None
+            except Exception as e:
+                print(f"[MetaDriveCapture] Reset failed: {e}")
+
+        # Cycle traffic lights + cache nearest-ahead reading for sim_state.
+        if self._tl_controller is not None:
+            try:
+                self._tl_controller.step()
+                agent = self._env.agent
+                self._last_light_ahead = self._tl_controller.find_nearest_ahead(
+                    ego_pos=(float(agent.position[0]), float(agent.position[1])),
+                    ego_heading=float(getattr(agent, 'heading_theta', 0.0)),
+                )
+            except Exception as e:
+                # Don't let TL bugs break the pipeline
+                print(f"[MetaDriveCapture] TL step error: {e}")
+                self._last_light_ahead = None
+        else:
+            self._last_light_ahead = None
 
         # ── Scene frame ───────────────────────────────────────────────
         scene_frame = self._extract_frame(obs)
@@ -245,10 +521,106 @@ class MetaDriveCapture:
             return {'speed_kmh': 0.0, 'speed_limit_kmh': 0.0,
                     'steering': 0.0, 'throttle': 0.0, 'brake': 0.0}
 
+    def get_sim_state(self) -> dict:
+        """
+        Oracle ground-truth pulled straight from MetaDrive every tick.
+        Used by modules/sim_labeler.py to produce broken/yellow/solid line
+        labels, wrong-side detection, current action and violation rows.
+
+        Returns:
+          {
+            'info':  {... env.step() info dict ...},
+            'agent': {
+                'velocity': (vx, vy),
+                'speed_kmh': float,
+                'heading_theta': float,
+                'on_lane': bool,
+                'position': (x, y),
+            },
+            'lane':  {
+                'left_marking':  (PGLineType_str, color_rgba),
+                'right_marking': (PGLineType_str, color_rgba),
+                'lane_direction': (dx, dy),
+                'lane_direction_deg': float,
+                'speed_limit_kmh': float,
+                'lateral_offset_m': float,
+            }
+          }
+        Returns {} if the env is closed or the agent has no lane yet.
+        """
+        try:
+            agent = self._env.agent
+            lane  = getattr(agent, 'lane', None)
+            out: dict = {'info': dict(self._last_info or {})}
+
+            vel = getattr(agent, 'velocity', (0.0, 0.0))
+            pos = getattr(agent, 'position', (0.0, 0.0))
+            out['agent'] = {
+                'velocity':      (float(vel[0]), float(vel[1])),
+                'speed_kmh':     float(getattr(agent, 'speed_km_h', 0.0) or 0.0),
+                'heading_theta': float(getattr(agent, 'heading_theta', 0.0)),
+                'on_lane':       bool(getattr(agent, 'on_lane', True)),
+                'position':      (float(pos[0]), float(pos[1])),
+            }
+
+            if lane is not None:
+                # line_types/line_colors are [left, right] lists.
+                lt = list(getattr(lane, 'line_types', []) or [])
+                lc = list(getattr(lane, 'line_colors', []) or [])
+                left_t  = lt[0] if len(lt) > 0 else 'UNKNOWN_LINE'
+                right_t = lt[1] if len(lt) > 1 else 'UNKNOWN_LINE'
+                left_c  = lc[0] if len(lc) > 0 else (1, 1, 1, 1)
+                right_c = lc[1] if len(lc) > 1 else (1, 1, 1, 1)
+
+                # Direction vector and yaw (degrees)
+                d = getattr(lane, 'direction', (1.0, 0.0))
+                try:
+                    dx, dy = float(d[0]), float(d[1])
+                except Exception:
+                    dx, dy = 1.0, 0.0
+                import math
+                yaw_deg = math.degrees(math.atan2(dy, dx))
+
+                # Lateral offset (positive => right of center)
+                lateral = 0.0
+                try:
+                    long_off, lat_off = lane.local_coordinates(pos)
+                    lateral = float(lat_off)
+                except Exception:
+                    pass
+
+                # MetaDrive's speed_limit is sometimes a sentinel like 1000.
+                # Cap to the agent's max_speed_km_h when unrealistic.
+                lim = float(getattr(lane, 'speed_limit', 0.0) or 0.0)
+                max_kmh = float(getattr(agent, 'max_speed_km_h', 80.0) or 80.0)
+                if lim <= 0 or lim > 200:
+                    lim = max_kmh
+
+                out['lane'] = {
+                    'left_marking':       (str(left_t), tuple(left_c)),
+                    'right_marking':      (str(right_t), tuple(right_c)),
+                    'lane_direction':     (dx, dy),
+                    'lane_direction_deg': yaw_deg,
+                    'speed_limit_kmh':    lim,
+                    'lateral_offset_m':   lateral,
+                }
+            # Nearest upcoming traffic light (None if no lights in map or
+            # none within lookahead/lateral tolerance).
+            out['traffic_light_ahead'] = self._last_light_ahead
+            return out
+        except Exception:
+            return {}
+
     def release(self):
         self._running = False
         self._driver.stop()
         self._driver.join(timeout=2)
+        if self._tl_controller is not None:
+            try:
+                self._tl_controller.destroy()
+            except Exception:
+                pass
+            self._tl_controller = None
         try:
             self._env.close()
         except Exception:

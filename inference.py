@@ -36,6 +36,7 @@ from modules.gaze_affordance_map import GazeAffordanceMap
 from modules.warning_engine      import WarningEngine
 from modules.voice_assistant     import VoiceAssistant
 from modules.run_session         import RunSession
+from modules.sim_labeler         import SimLabeler
 
 
 # ------------------------------------------------------------------ #
@@ -74,6 +75,10 @@ class DriverIntentSystem:
         self.gaze_map   = GazeAffordanceMap()
         self.warning_eng = WarningEngine()
         self.voice       = VoiceAssistant(enabled=voice_enabled)
+        # Oracle labeller for the MetaDrive scene source. No-op when running
+        # with real cameras / CARLA (the capture object won't expose
+        # get_sim_state() and SimLabeler returns {} silently).
+        self.sim_labeler = SimLabeler()
         self._model_path = model_path
 
         # logger and run session created lazily once we know the run mode
@@ -211,7 +216,7 @@ class DriverIntentSystem:
         # Main loop: display
         fps_buf = []
 
-        print("Press 'q' to quit.\n")
+        print("Press 'q' or Esc to quit.\n")
         try:
             while self._running:
                 t0 = time.perf_counter()
@@ -321,7 +326,11 @@ class DriverIntentSystem:
 
                 cv2.imshow('Driver Intent Monitor v2', vis)
 
-                if cv2.waitKey(1) & 0xFF == ord('q'):
+                # Stop only on explicit user quit. Crashes / violations /
+                # off-road events DO NOT end the run -- MetaDrive is
+                # configured to keep stepping through them.
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q') or key == 27:   # 27 = Esc
                     break
 
         except KeyboardInterrupt:
@@ -385,14 +394,25 @@ class DriverIntentSystem:
                     detections   = detections
                 )
 
+            telemetry_now = (self.capture.get_telemetry()
+                             if hasattr(self.capture, 'get_telemetry') else None)
+
+            # Oracle sim labels: lane markings, current action, violations
+            # (only populated when the capture is MetaDriveCapture).
+            try:
+                sim_label = self.sim_labeler.label(self.capture, telemetry_now)
+            except Exception as e:
+                print(f"[FusionWorker] SimLabel error: {e}")
+                sim_label = {}
+
             frame_data: Dict = {
                 'timestamp':        time.time(),
                 'frame_number':     self._frame_count,
                 'gaze_data':        gaze_data,
                 'detected_objects': detections,
                 'gaze_affordance':  gaze_affordance,
-                'carla_telemetry':  (self.capture.get_telemetry()
-                                     if hasattr(self.capture, 'get_telemetry') else None)
+                'carla_telemetry':  telemetry_now,
+                'sim_label':        sim_label,
             }
 
             # Intent prediction
@@ -481,8 +501,8 @@ class DriverIntentSystem:
 # ------------------------------------------------------------------ #
 def main():
     parser = argparse.ArgumentParser(description='Driver Intent Monitor v2')
-    parser.add_argument('--driver',  default='1',  help='Driver cam index or video path')
-    parser.add_argument('--scene',   default='0',  help='Scene cam index or video path (ignored in sim modes)')
+    parser.add_argument('--driver',  default='0',  help='Driver cam index or video path')
+    parser.add_argument('--scene',   default='1',  help='Scene cam index or video path (ignored in sim modes)')
     parser.add_argument('--model',   default=None, help='Model checkpoint path')
     parser.add_argument('--output',  default=None, help='Output video path')
     parser.add_argument('--no-log',  action='store_true', help='Disable logging')

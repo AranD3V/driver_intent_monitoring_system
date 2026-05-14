@@ -118,4 +118,11 @@ class RollingLogger:
                 'probabilities': ip.get('probabilities')
             }
 
+        # Sim oracle labels (MetaDrive only). Persisted in full so the
+        # session-log batches double as a labelled training set for the
+        # progressive-training loop in scripts/train_intent.py.
+        sim = fd.get('sim_label')
+        if sim:
+            out['sim_label'] = sim
+
         return out

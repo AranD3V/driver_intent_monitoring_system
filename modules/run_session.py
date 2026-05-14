@@ -80,12 +80,22 @@ class RunSession:
         self._fps_samples: List[float] = []
         self._last_scene_frame: Optional[np.ndarray] = None
 
+        # Sim-oracle aggregates (only populated in MetaDrive mode)
+        self._action_counts:    Counter = Counter()
+        self._lane_left_counts: Counter = Counter()
+        self._lane_right_counts: Counter = Counter()
+        self._violation_log: List[Dict] = []
+        self._violation_counts: Counter = Counter()
+        self._wrong_side_frames = 0
+        self._off_road_frames   = 0
+
         # Paths
         self.composite_video_path = str(self.dir / 'composite_video.mp4')
         self.scene_video_path     = str(self.dir / 'scene_video.mp4')
         self.heatmap_path         = str(self.dir / 'gaze_affordance_map.png')
         self.overlay_path         = str(self.dir / 'gaze_affordance_overlay.png')
         self.warnings_csv_path    = str(self.dir / 'warnings.csv')
+        self.violations_csv_path  = str(self.dir / 'violations.csv')
         self.voice_log_path       = str(self.dir / 'voice_log.json')
         self.summary_json_path    = str(self.dir / 'summary.json')
         self.summary_md_path      = str(self.dir / 'summary.md')
@@ -131,6 +141,35 @@ class RunSession:
         if ga and ga.get('looked_object'):
             cls = ga['looked_object'].get('class', '?')
             self._gaze_object_dwell[cls] += 1
+
+        # Sim-oracle labels (MetaDrive only — empty dict otherwise)
+        sim = frame_data.get('sim_label') or {}
+        if sim:
+            action = sim.get('action')
+            if action:
+                self._action_counts[action] += 1
+            lane = sim.get('lane') or {}
+            if lane.get('left'):
+                self._lane_left_counts[lane['left']] += 1
+            if lane.get('right'):
+                self._lane_right_counts[lane['right']] += 1
+            if sim.get('wrong_side'):
+                self._wrong_side_frames += 1
+            if not sim.get('on_lane', True):
+                self._off_road_frames += 1
+            for v in sim.get('violations') or []:
+                kind = v.get('kind', 'unknown')
+                self._violation_counts[kind] += 1
+                self._violation_log.append({
+                    'frame':    self._frame_count,
+                    'time':     round(time.time() - self.start_time, 2),
+                    'kind':     kind,
+                    'severity': v.get('severity', 'advisory'),
+                    'message':  v.get('message', ''),
+                    'action':   action or '',
+                    'lane_L':   (lane.get('left')  or ''),
+                    'lane_R':   (lane.get('right') or ''),
+                })
 
         # Warnings
         warns = frame_data.get('warnings') or []
@@ -191,6 +230,20 @@ class RunSession:
         except Exception as e:
             print(f"[RunSession] Warnings CSV failed: {e}")
 
+        # ── Violations CSV (sim oracle — empty in non-sim modes) ───────
+        if self._violation_log:
+            try:
+                with open(self.violations_csv_path, 'w', newline='',
+                          encoding='utf-8') as f:
+                    cols = ['frame', 'time', 'kind', 'severity',
+                            'action', 'lane_L', 'lane_R', 'message']
+                    w = csv.DictWriter(f, fieldnames=cols)
+                    w.writeheader()
+                    for row in self._violation_log:
+                        w.writerow({k: row.get(k, '') for k in cols})
+            except Exception as e:
+                print(f"[RunSession] Violations CSV failed: {e}")
+
         # ── Voice log ──────────────────────────────────────────────────
         # Always write the file (even empty) so downstream tooling has a
         # stable contract — every run produces voice_log.json.
@@ -231,11 +284,22 @@ class RunSession:
             'gaze_miss_count':      self._gaze_miss_count,
             'gaze_miss_pct':        round(gaze_miss_pct, 1),
             'voice_prompts_spoken': spoken_count,
+            'sim_oracle': {
+                'action_distribution':     dict(self._action_counts),
+                'lane_left_distribution':  dict(self._lane_left_counts),
+                'lane_right_distribution': dict(self._lane_right_counts),
+                'violations_total':        sum(self._violation_counts.values()),
+                'violations_by_kind':      dict(self._violation_counts),
+                'wrong_side_frames':       self._wrong_side_frames,
+                'off_road_frames':         self._off_road_frames,
+            },
             'artefacts': {
                 'composite_video':   str(self.composite_video_path),
                 'gaze_heatmap':      self.heatmap_path if heatmap_saved else None,
                 'gaze_overlay':      self.overlay_path if overlay_saved else None,
                 'warnings_csv':      self.warnings_csv_path,
+                'violations_csv':    (self.violations_csv_path
+                                      if self._violation_log else None),
                 'voice_log':         self.voice_log_path,
             },
         }
@@ -301,6 +365,30 @@ class RunSession:
             for k, v in sorted(s['gaze_object_dwell_frames'].items(),
                                key=lambda kv: -kv[1]):
                 lines.append(f"- {k}: {v} frames")
+
+        sim = s.get('sim_oracle') or {}
+        if sim.get('action_distribution'):
+            lines += ["", f"## Sim Oracle (MetaDrive ground truth)"]
+            lines.append(f"- **Violations total:** {sim.get('violations_total', 0)}")
+            for k, v in sorted(sim.get('violations_by_kind', {}).items(),
+                               key=lambda kv: -kv[1]):
+                lines.append(f"  - {k}: {v}")
+            lines.append(f"- Wrong-side frames: {sim.get('wrong_side_frames', 0)}")
+            lines.append(f"- Off-road frames: {sim.get('off_road_frames', 0)}")
+            lines.append("")
+            lines.append(f"### Actions")
+            total_a = sum(sim['action_distribution'].values()) or 1
+            for k, v in sorted(sim['action_distribution'].items(),
+                               key=lambda kv: -kv[1]):
+                lines.append(f"- {k}: {v} ({100*v/total_a:.1f}%)")
+            lines.append("")
+            lines.append(f"### Lane markings encountered")
+            for side, label in (('Left', 'lane_left_distribution'),
+                                ('Right', 'lane_right_distribution')):
+                if sim.get(label):
+                    lines.append(f"- {side}: " + ", ".join(
+                        f"{k}={v}" for k, v in sorted(sim[label].items(),
+                                                     key=lambda kv: -kv[1])))
 
         lines += [
             "",
