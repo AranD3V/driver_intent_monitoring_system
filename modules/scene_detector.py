@@ -136,7 +136,8 @@ class SceneDetector:
     def __init__(self,
                  model_name: str = 'yolov8n.pt',
                  confidence_threshold: float = 0.4,
-                 scene_calib_path: str = 'calibration/scene_cam.yaml'):
+                 scene_calib_path: str = 'calibration/scene_cam.yaml',
+                 imgsz: int = 416):
 
         # Resolve relative model paths against the repo root so the tool
         # works regardless of CWD. If the user passes an absolute path or
@@ -157,6 +158,7 @@ class SceneDetector:
                 f"Original error: {e}"
             ) from e
         self.conf_thresh = confidence_threshold
+        self.imgsz       = int(imgsz)
         self.class_names = self.model.names
         self.tracker = IoUTracker()
 
@@ -176,7 +178,7 @@ class SceneDetector:
         if scene_frame is None:
             return []
 
-        results = self.model(scene_frame, verbose=False)[0]
+        results = self.model(scene_frame, verbose=False, imgsz=self.imgsz)[0]
         detections = []
 
         for box in results.boxes:

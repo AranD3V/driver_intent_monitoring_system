@@ -96,20 +96,27 @@ class IntentSequenceDataset(Dataset):
                  use_native_labels: bool = False,
                  max_wins_per_seq: int = 0,
                  weak_aug: bool = False,
-                 use_weak_weights: bool = False):
+                 use_weak_weights: bool = False,
+                 min_weak_conf: float = 0.0):
         self.seq_len = seq_len
         self.augment = augment
         self.weak_aug = weak_aug                  # use modules.feature_augment pipeline
         self.use_weak_weights = use_weak_weights  # populate sample_weights from weak_label_meta
+        self.min_weak_conf = float(min_weak_conf) # drop entries below this consensus_confidence
         self.classes = list(classes) if classes is not None else list(INTENT_CLASSES)
 
         self._sequences: list = []   # (ndarray T x F, label_idx, ttm)
         self._seq_ids:   list = []   # one entry per window, for CV grouping
         self.sample_weights: list = []  # per-window float, parallel to _sequences
+        self._dropped_low_conf = 0
 
         paths = sorted(data_paths) if isinstance(data_paths, (list, tuple)) else [data_paths]
         for p in paths:
             self._load(str(p), stride, use_native_labels, max_wins_per_seq)
+
+        if self.min_weak_conf > 0 and self._dropped_low_conf:
+            print(f"  [min-weak-conf={self.min_weak_conf:.2f}] "
+                  f"dropped {self._dropped_low_conf} sequences below threshold")
 
         counts = Counter(lbl for _, lbl, _ in self._sequences)
         print("Dataset: {:d} windows | ".format(len(self._sequences)) +
@@ -134,6 +141,14 @@ class IntentSequenceDataset(Dataset):
                 dropped[raw or '(missing)'] += 1
                 continue
             label_idx = self.classes.index(raw)
+
+            # ── Drop low-confidence weak labels (audit-driven filter) ─────
+            if self.min_weak_conf > 0:
+                meta = entry.get('weak_label_meta') or {}
+                conf = float(meta.get('consensus_confidence', 1.0) or 1.0)
+                if conf < self.min_weak_conf:
+                    self._dropped_low_conf += 1
+                    continue
 
             # ── Sequence ID (for group-aware CV) ──────────────────────────
             seq_id = (entry.get('seq_id')
@@ -341,7 +356,7 @@ def _seq_level_split(full_ds: IntentSequenceDataset, val_frac: float = 0.2,
     return train_idx, val_idx
 
 
-def _make_loaders(full_ds, train_idx, val_idx, batch):
+def _make_loaders(full_ds, train_idx, val_idx, batch, balance_classes: bool = False):
     nw = 0 if sys.platform == 'win32' else 4
     pin = torch.cuda.is_available()
     train_set = _Subset(full_ds, train_idx, augment=True)
@@ -349,7 +364,26 @@ def _make_loaders(full_ds, train_idx, val_idx, batch):
     sampler = None
     shuffle = True
     sw = getattr(full_ds, 'sample_weights', None)
-    if sw and getattr(full_ds, 'use_weak_weights', False) and any(w != 1.0 for w in sw):
+
+    if balance_classes:
+        # Per-sample weight = 1 / class_count. Each batch becomes class-balanced
+        # in expectation, regardless of raw frequency. Multiplies with any
+        # weak-supervision weights already on the dataset.
+        from torch.utils.data import WeightedRandomSampler
+        train_labels = [full_ds._sequences[i][1] for i in train_idx]
+        counts = Counter(train_labels)
+        n_classes = len(getattr(full_ds, 'classes', [])) or (max(counts) + 1)
+        inv = [1.0 / max(counts.get(c, 0), 1) for c in range(n_classes)]
+        base = sw if sw else [1.0] * len(full_ds._sequences)
+        weights = torch.tensor(
+            [inv[full_ds._sequences[i][1]] * base[i] for i in train_idx],
+            dtype=torch.double)
+        sampler = WeightedRandomSampler(weights, num_samples=len(weights),
+                                        replacement=True)
+        shuffle = False
+        print(f"  balance-classes sampler: per-class counts={dict(counts)} "
+              f"(weight range {weights.min():.4f}..{weights.max():.4f})")
+    elif sw and getattr(full_ds, 'use_weak_weights', False) and any(w != 1.0 for w in sw):
         from torch.utils.data import WeightedRandomSampler
         weights = torch.tensor([sw[i] for i in train_idx], dtype=torch.double)
         sampler = WeightedRandomSampler(weights, num_samples=len(weights),
@@ -383,13 +417,16 @@ def train(args):
         augment=False, classes=classes, use_native_labels=args.native_labels,
         max_wins_per_seq=args.max_wins_per_seq,
         weak_aug=getattr(args, 'weak_aug', False),
-        use_weak_weights=getattr(args, 'use_weak_weights', False))
+        use_weak_weights=getattr(args, 'use_weak_weights', False),
+        min_weak_conf=getattr(args, 'min_weak_conf', 0.0))
 
     train_idx, val_idx = _seq_level_split(full_ds, seed=42)
     print("Split: {:d} train / {:d} val windows".format(
         len(train_idx), len(val_idx)))
 
-    train_loader, val_loader = _make_loaders(full_ds, train_idx, val_idx, args.batch)
+    train_loader, val_loader = _make_loaders(
+        full_ds, train_idx, val_idx, args.batch,
+        balance_classes=getattr(args, 'balance_classes', False))
     model = _build_model(args, len(classes), device)
 
     ckpt_path = Path(args.output)
@@ -529,7 +566,8 @@ def train_kfold(args):
         augment=False, classes=classes, use_native_labels=args.native_labels,
         max_wins_per_seq=args.max_wins_per_seq,
         weak_aug=getattr(args, 'weak_aug', False),
-        use_weak_weights=getattr(args, 'use_weak_weights', False))
+        use_weak_weights=getattr(args, 'use_weak_weights', False),
+        min_weak_conf=getattr(args, 'min_weak_conf', 0.0))
 
     n     = len(full_ds._sequences)
     y_arr = np.array([lbl for _, lbl, _ in full_ds._sequences])
@@ -570,7 +608,8 @@ def train_kfold(args):
                         for c in range(len(classes))))
 
         train_loader, val_loader = _make_loaders(
-            full_ds, train_idx.tolist(), val_idx.tolist(), args.batch)
+            full_ds, train_idx.tolist(), val_idx.tolist(), args.batch,
+            balance_classes=getattr(args, 'balance_classes', False))
 
         model     = _build_model(args, len(classes), device)
         cw        = _class_weights(y_arr[train_idx].tolist(), len(classes), device)
@@ -848,6 +887,10 @@ def main():
                     help='Use telemetry-aware augmentation (modules.feature_augment)')
     tr.add_argument('--use-weak-weights', action='store_true', dest='use_weak_weights',
                     help='Read consensus_confidence from weak_label_meta as sample weight')
+    tr.add_argument('--balance-classes', action='store_true', dest='balance_classes',
+                    help='Per-class WeightedRandomSampler so each batch is class-balanced')
+    tr.add_argument('--min-weak-conf', type=float, default=0.0, dest='min_weak_conf',
+                    help='Drop sequences with weak_label_meta.consensus_confidence below this')
 
     # ── train-kfold ────────────────────────────────────────────────────────
     kf = sub.add_parser('train-kfold')
@@ -875,6 +918,10 @@ def main():
                     help='Read consensus_confidence from weak_label_meta as sample weight')
     kf.add_argument('--keep-folds',   action='store_true', dest='keep_folds',
                     help='Preserve per-fold checkpoints for ensembling')
+    kf.add_argument('--balance-classes', action='store_true', dest='balance_classes',
+                    help='Per-class WeightedRandomSampler so each batch is class-balanced')
+    kf.add_argument('--min-weak-conf', type=float, default=0.0, dest='min_weak_conf',
+                    help='Drop sequences with weak_label_meta.consensus_confidence below this')
 
     # ── evaluate ────────────────────────────────────────────────────────────
     ev = sub.add_parser('evaluate')

@@ -127,6 +127,12 @@ _TRIGGERS = [
 # graduated high->critical can re-fire when the situation worsens.
 _COOLDOWN_FRAMES = 18
 
+# If the driver was looking at an object within this many evaluate() calls,
+# downgrade its warning severity by one step — driver is already aware.
+# critical is NEVER fully suppressed; advisories are dropped entirely.
+_GAZE_RECENT_FRAMES = 30
+_DOWNGRADE = {'critical': 'high', 'high': 'advisory', 'advisory': None}
+
 SEVERITY_ORDER = {'critical': 0, 'high': 1, 'advisory': 2}
 
 
@@ -155,6 +161,11 @@ class WarningEngine:
     def __init__(self):
         # track_id → frames since last warning fired
         self._cooldown: Dict[int, int] = defaultdict(lambda: _COOLDOWN_FRAMES)
+
+        # track_id → frames since driver last gazed at it. 0 = looking now.
+        # Inflates each tick; reset to 0 when gaze lands on the track.
+        self._gaze_recency: Dict[int, int] = defaultdict(
+            lambda: _GAZE_RECENT_FRAMES + 1)
 
         # Driver-state internal state
         self._eyes_closed_started_at: Optional[float] = None
@@ -191,9 +202,11 @@ class WarningEngine:
         same returned list -- so they flow through the voice assistant,
         warnings.csv, and run summary identically to scene warnings.
         """
-        # Age all cooldowns
+        # Age all cooldowns + gaze-recency counters
         for tid in list(self._cooldown):
             self._cooldown[tid] += 1
+        for tid in list(self._gaze_recency):
+            self._gaze_recency[tid] += 1
 
         # Inject scene size into each det so the trigger lambdas can read it
         if scene_size is not None:
@@ -205,6 +218,8 @@ class WarningEngine:
         gazed_id = None
         if gaze_affordance and gaze_affordance.get('looked_object'):
             gazed_id = gaze_affordance['looked_object'].get('track_id')
+            if gazed_id is not None:
+                self._gaze_recency[gazed_id] = 0
 
         active: List[Dict] = []
 
@@ -230,8 +245,21 @@ class WarningEngine:
                     state=state,
                 )
 
+                # Gaze-aware severity downgrade: if the driver was looking at
+                # this track within the recent window, they're already aware,
+                # so step the severity down. critical -> high, high -> advisory,
+                # advisory -> dropped entirely. Never suppresses a critical
+                # outright (driver awareness ≠ avoidance).
+                effective_severity = severity
+                if self._gaze_recency[tid] <= _GAZE_RECENT_FRAMES:
+                    downgraded = _DOWNGRADE.get(severity, severity)
+                    if downgraded is None:
+                        self._cooldown[tid] = 0
+                        break
+                    effective_severity = downgraded
+
                 active.append({
-                    'severity':   severity,
+                    'severity':   effective_severity,
                     'message':    msg,
                     'affordance': det.get('affordance', 'Unknown'),
                     'class':      cls,
@@ -347,6 +375,7 @@ class WarningEngine:
 
     def reset(self):
         self._cooldown.clear()
+        self._gaze_recency.clear()
         self._eyes_closed_started_at = None
         self._speed_history.clear()
         self._driver_warn_cooldown.clear()
