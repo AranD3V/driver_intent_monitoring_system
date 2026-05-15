@@ -326,6 +326,9 @@ class TemporalIntentPredictor:
 
         self.model = TemporalIntentModel().to(self.device)
         self.model.eval()
+        # Ensemble mode: when populated, predict() averages softmax across all.
+        self.ensemble_models: list = []
+        self._classes = list(INTENT_CLASSES)
 
     # -- public --------------------------------------------------------
 
@@ -386,17 +389,46 @@ class TemporalIntentPredictor:
         t   = torch.FloatTensor(seq).unsqueeze(0).to(self.device)        # (1, T, F)
 
         with torch.no_grad():
-            logits = self.model(t)                                        # (1, C)
-            probs  = torch.softmax(logits, dim=1)[0]
+            if self.ensemble_models:
+                # Average softmax across all ensemble models
+                acc = None
+                for m in self.ensemble_models:
+                    p = torch.softmax(m(t), dim=1)
+                    acc = p if acc is None else acc + p
+                probs = (acc / len(self.ensemble_models))[0]
+            else:
+                logits = self.model(t)
+                probs  = torch.softmax(logits, dim=1)[0]
             idx    = int(probs.argmax())
 
+        classes = self._classes
         return {
-            'intent':        INTENT_CLASSES[idx],
+            'intent':        classes[idx],
             'confidence':    float(probs[idx]),
-            'probabilities': {INTENT_CLASSES[i]: float(probs[i]) for i in range(len(INTENT_CLASSES))},
+            'probabilities': {classes[i]: float(probs[i]) for i in range(len(classes))},
             'ready':         True,
             'warmup_progress': 1.0
         }
+
+    def _build_model_from_ckpt(self, ckpt: dict):
+        """Rebuild a TemporalIntentModel matching the checkpoint's saved arch."""
+        arch    = ckpt.get('arch', {}) or {}
+        classes = ckpt.get('classes') or list(INTENT_CLASSES)
+        # Infer stream_hidden from weight shape if not saved in arch
+        if 'stream_hidden' not in arch:
+            state = ckpt.get('model_state_dict', ckpt)
+            w = state.get('lstm.weight_ih_l0')
+            arch['stream_hidden'] = int(w.shape[0] // 4) if w is not None else 128
+        m = TemporalIntentModel(
+            input_size    = FEATURE_DIM,
+            stream_hidden = arch.get('stream_hidden', 128),
+            num_layers    = arch.get('num_layers', 2),
+            num_heads     = arch.get('num_heads', 4),
+            num_classes   = len(classes),
+            dropout       = arch.get('dropout', 0.3),
+        ).to(self.device)
+        m.eval()
+        return m, classes
 
     def load_weights(self, path: str) -> bool:
         """
@@ -404,6 +436,9 @@ class TemporalIntentPredictor:
         On any failure (missing file, architecture mismatch, class-count
         mismatch) prints a clear diagnostic, leaves the predictor in
         rule-based mode and returns False — never raises.
+
+        Rebuilds the model to match the checkpoint's saved arch, so
+        non-default hidden sizes (e.g. Round 2's hidden=192) load cleanly.
         """
         try:
             ckpt = torch.load(path, map_location=self.device)
@@ -415,25 +450,68 @@ class TemporalIntentPredictor:
                   f"{path}: {e}")
             return False
 
-        state = ckpt.get('model_state_dict', ckpt) \
-                if isinstance(ckpt, dict) else ckpt
+        if not isinstance(ckpt, dict):
+            print(f"[TemporalPredictor] Unexpected checkpoint format at {path}")
+            return False
 
         try:
-            self.model.load_state_dict(state, strict=True)
-            self.model.eval()
+            model, classes = self._build_model_from_ckpt(ckpt)
+            state = ckpt.get('model_state_dict', ckpt)
+            model.load_state_dict(state, strict=True)
+            self.model         = model
+            self._classes      = classes
+            self.ensemble_models = []
             self._weights_loaded = True
-            print(f"[TemporalPredictor] Loaded weights from {path}")
+            print(f"[TemporalPredictor] Loaded weights from {path} "
+                  f"(classes={classes}, val_acc={ckpt.get('val_acc', -1.0):.1f}%)")
             return True
         except RuntimeError as e:
             print(f"[TemporalPredictor] Checkpoint at {path} does not "
                   f"match the current model architecture.")
-            # Show only the salient summary, not the 30-line key dump
             msg = str(e)
             head = msg.splitlines()[0] if msg else ''
             print(f"[TemporalPredictor]   {head}")
             print("[TemporalPredictor] Falling back to rule-based intent.")
             self._weights_loaded = False
             return False
+
+    def load_ensemble(self, paths: list) -> bool:
+        """
+        Load multiple checkpoints for ensemble inference. predict() averages
+        softmax across all loaded models. Returns True if >= 1 loaded.
+        All checkpoints must share the same class list (sanity check).
+        """
+        loaded = []
+        ref_classes = None
+        for p in paths:
+            try:
+                ckpt = torch.load(p, map_location=self.device)
+                model, classes = self._build_model_from_ckpt(ckpt)
+                model.load_state_dict(
+                    ckpt.get('model_state_dict', ckpt), strict=True)
+                if ref_classes is None:
+                    ref_classes = classes
+                elif classes != ref_classes:
+                    print(f"[TemporalPredictor] Class mismatch in {p}: "
+                          f"{classes} vs {ref_classes} — skipping")
+                    continue
+                loaded.append((p, model, float(ckpt.get('val_acc', -1.0))))
+            except Exception as e:
+                print(f"[TemporalPredictor] Could not load {p}: {e}")
+                continue
+
+        if not loaded:
+            print("[TemporalPredictor] Ensemble: no checkpoints loaded.")
+            self._weights_loaded = False
+            return False
+
+        self.ensemble_models = [m for _, m, _ in loaded]
+        self._classes        = ref_classes or list(INTENT_CLASSES)
+        self._weights_loaded = True
+        print(f"[TemporalPredictor] Ensemble: loaded {len(loaded)} checkpoints")
+        for p, _, acc in loaded:
+            print(f"  - {p} (val_acc={acc:.1f}%)")
+        return True
 
     def set_scene_resolution(self, w: int, h: int):
         """Update scene dimensions for correct feature normalization."""

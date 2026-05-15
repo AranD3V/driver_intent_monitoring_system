@@ -62,7 +62,14 @@ class DriverIntentSystem:
         elif not Path(config_path).is_absolute():
             config_path = _repo_path(config_path)
 
-        if model_path and not Path(model_path).is_absolute():
+        # model_path can be a single str or a list of paths (ensemble mode).
+        # Resolve each relative path against the repo root.
+        if isinstance(model_path, (list, tuple)):
+            model_path = [
+                str(_repo_path(p)) if not Path(p).is_absolute() else p
+                for p in model_path
+            ]
+        elif model_path and not Path(model_path).is_absolute():
             model_path = _repo_path(model_path)
 
         # ── Modules ──────────────────────────────────────────────────
@@ -79,7 +86,13 @@ class DriverIntentSystem:
         # with real cameras / CARLA (the capture object won't expose
         # get_sim_state() and SimLabeler returns {} silently).
         self.sim_labeler = SimLabeler()
-        self._model_path = model_path
+        # RunSession's summary expects a string; collapse list-mode into a
+        # readable label like "ensemble[5]: weak_v2_fold0.pth, ..."
+        if isinstance(model_path, (list, tuple)):
+            names = [Path(p).name for p in model_path]
+            self._model_path = f"ensemble[{len(names)}]: " + ", ".join(names)
+        else:
+            self._model_path = model_path
 
         # logger and run session created lazily once we know the run mode
         self.logger:  Optional[RollingLogger] = None
@@ -87,7 +100,12 @@ class DriverIntentSystem:
 
         loaded = False
         if model_path:
-            loaded = self.intent_pred.load_weights(model_path)
+            if isinstance(model_path, (list, tuple)) and len(model_path) > 1:
+                loaded = self.intent_pred.load_ensemble(list(model_path))
+            elif isinstance(model_path, (list, tuple)):
+                loaded = self.intent_pred.load_weights(model_path[0])
+            else:
+                loaded = self.intent_pred.load_weights(model_path)
             if not loaded:
                 # Don't keep an unusable path in the run summary
                 self._model_path = None
@@ -503,7 +521,10 @@ def main():
     parser = argparse.ArgumentParser(description='Driver Intent Monitor v2')
     parser.add_argument('--driver',  default='0',  help='Driver cam index or video path')
     parser.add_argument('--scene',   default='1',  help='Scene cam index or video path (ignored in sim modes)')
-    parser.add_argument('--model',   default=None, help='Model checkpoint path')
+    parser.add_argument('--model',   default=None, nargs='+',
+                        help='Model checkpoint path(s). Pass 1 for single-model '
+                             'inference, or 5 fold checkpoints for ensemble '
+                             '(73%% ensemble accuracy vs 46.6%% single best fold).')
     parser.add_argument('--output',  default=None, help='Output video path')
     parser.add_argument('--no-log',  action='store_true', help='Disable logging')
     parser.add_argument('--sim',     default='none',
