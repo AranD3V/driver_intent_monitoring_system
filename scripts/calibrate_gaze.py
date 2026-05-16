@@ -135,7 +135,7 @@ def _wait_for_start(width: int, height: int,
             "Look at each dot until the ring fills.",
             "Keep your head still; eyes do most of the work.",
             "",
-            "Press SPACE to start, ESC to abort.",
+            "Press SPACE, ENTER, or Y to start.  ESC or Q to abort.",
         ]
         cv2.putText(canvas, title, (60, 80),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.2, (235, 235, 235),
@@ -151,7 +151,9 @@ def _wait_for_start(width: int, height: int,
                 _draw_preview(canvas, frame)
         cv2.imshow(WINDOW, canvas)
         k = cv2.waitKey(30) & 0xFF
-        if k == 32:    # space
+        # Accept SPACE, ENTER, Y, or y as "start" — many users press Y here
+        # because the RUN.bat menu just asked them a Y/N question.
+        if k in (32, 13, ord('y'), ord('Y')):
             return True
         if k in (27, ord('q'), ord('Q')):
             return False

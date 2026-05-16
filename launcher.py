@@ -120,6 +120,43 @@ def _checkpoint_matches(path: Path, ref_shapes: dict) -> bool:
     return True
 
 
+def find_ensemble_models(models_dir: str = 'models',
+                         pattern: str = 'weak_v*_fold*.pth') -> Optional[List[str]]:
+    """
+    Look for the Round 2+ k-fold ensemble checkpoints. Returns a sorted list
+    of paths when a complete set (>= 2 fold checkpoints sharing the same
+    stem prefix) is found, else None.
+
+    The new arch-aware loader in TemporalIntentPredictor reads
+    `arch.stream_hidden` from each checkpoint, so non-default hidden sizes
+    (e.g. Round 2's hidden=192) load cleanly without architecture probing.
+    """
+    p = Path(models_dir)
+    if not p.exists():
+        return None
+
+    # Group fold checkpoints by stem (everything before "_fold<N>")
+    import re
+    groups: dict = {}
+    for f in p.glob(pattern):
+        m = re.match(r'(.+)_fold\d+\.pth$', f.name)
+        if not m:
+            continue
+        stem = m.group(1)
+        groups.setdefault(stem, []).append(f)
+
+    if not groups:
+        return None
+
+    # Pick the most recent stem (by max mtime within the group)
+    best_stem = max(groups, key=lambda s: max(f.stat().st_mtime
+                                              for f in groups[s]))
+    members = sorted(groups[best_stem], key=lambda f: f.name)
+    if len(members) < 2:
+        return None
+    return [str(f) for f in members]
+
+
 def find_latest_model(models_dir: str = 'models') -> Optional[str]:
     """
     Return the newest .pth in models/ that actually loads cleanly into
@@ -279,17 +316,31 @@ def configure_carla() -> dict:
             'carla_host': host, 'carla_port': port}
 
 
-def run_calibration_flow() -> int:
-    """Launch the 9-point gaze calibration script directly."""
-    cams = discover_cameras()
-    if not cams:
-        print("\nERROR: No driver-facing camera detected.")
-        return 1
-    indices = [c[0] for c in cams]
-    print()
-    driver = _ask_int("Driver-cam index", _default_driver(indices),
-                      allowed=indices)
-    fullscreen = _ask_yesno("Run fullscreen?", default_yes=True)
+def run_calibration_flow(quick: bool = False,
+                         driver_override: Optional[int] = None) -> int:
+    """Launch the 9-point gaze calibration script directly.
+
+    When `quick` is True (e.g. invoked from RUN.bat), skip camera probing
+    and use `driver_override` if given (the camera index the user selected
+    in the menu); otherwise fall back to camera 0.
+    """
+    if quick:
+        driver = driver_override if driver_override is not None else 0
+        fullscreen = True
+        print(f"[Launcher] --quick: driver-cam={driver}, fullscreen=yes "
+              f"(skipping probe to avoid DirectShow race)")
+        # Give Windows a moment in case anything else briefly held the cam
+        time.sleep(0.5)
+    else:
+        cams = discover_cameras()
+        if not cams:
+            print("\nERROR: No driver-facing camera detected.")
+            return 1
+        indices = [c[0] for c in cams]
+        print()
+        driver = _ask_int("Driver-cam index", _default_driver(indices),
+                          allowed=indices)
+        fullscreen = _ask_yesno("Run fullscreen?", default_yes=True)
 
     import subprocess
     cmd = [sys.executable,
@@ -353,6 +404,9 @@ def main() -> None:
                         choices=['two-cam', 'metadrive', 'carla',
                                  'replay', 'calibrate'],
                         help='Skip the menu and use this mode')
+    parser.add_argument('--list-cameras', action='store_true',
+                        help='Probe attached cameras, print one line per '
+                             'working camera, and exit (used by RUN.bat menu)')
     parser.add_argument('--driver', default=None,
                         help='Driver source (camera index or video path); '
                              'overrides the interactive prompt')
@@ -366,20 +420,45 @@ def main() -> None:
                         help='Skip all interactive prompts (auto-pick '
                              'driver cam, no calibration offer). For '
                              'one-click demo mode from RUN.bat.')
-    parser.add_argument('--model', default=None,
-                        help='Intent model checkpoint (auto-detected if omitted)')
+    parser.add_argument('--model', default=None, nargs='+',
+                        help='Intent model checkpoint(s). Pass 1 for single-model '
+                             'inference, or multiple fold checkpoints for ensemble. '
+                             'Auto-detected if omitted (ensemble preferred).')
+    parser.add_argument('--single-model', action='store_true',
+                        help='Skip ensemble auto-discovery and force '
+                             'single-checkpoint mode')
     parser.add_argument('--no-voice', action='store_true',
                         help='Disable spoken driver-assist prompts')
     parser.add_argument('--run-root', default='runs',
                         help='Parent dir for per-run output bundles')
     args = parser.parse_args()
 
+    # 0. Camera listing only (RUN.bat menu invokes this before prompting)
+    if args.list_cameras:
+        cams = discover_cameras()
+        if not cams:
+            print("\n  No working cameras found.")
+            return sys.exit(1)
+        print()
+        print("  Available cameras:")
+        for idx, w, h in cams:
+            print(f"    [{idx}] {w}x{h}")
+        return sys.exit(0)
+
     # 1. Pick mode
     mode = args.mode or pick_mode_interactive()
 
     # Calibration is its own end-state — run and exit
     if mode == 'calibrate':
-        return sys.exit(run_calibration_flow())
+        # If --driver was passed, use it; otherwise let run_calibration_flow decide
+        drv_arg = None
+        if args.driver is not None:
+            try:
+                drv_arg = int(args.driver)
+            except (ValueError, TypeError):
+                drv_arg = None
+        return sys.exit(run_calibration_flow(quick=args.quick,
+                                             driver_override=drv_arg))
 
     # Offer camera calibration before each run (skipped in --quick mode)
     if not args.quick:
@@ -407,22 +486,38 @@ def main() -> None:
         else:
             cfg = _CONFIGURERS[mode]()
 
-    # 3. Trained model auto-discovery
+    # 3. Trained model auto-discovery (ensemble preferred, single-checkpoint fallback)
     model_path = args.model
     if model_path:
-        print(f"\n[Launcher] Using intent model (from --model): {model_path}")
-    else:
-        model_path = find_latest_model()
-        if model_path:
-            mb = Path(model_path).stat().st_size / 1e6
-            print(f"\n[Launcher] Loaded intent model: "
-                  f"{Path(model_path).name} ({mb:.1f} MB)")
-            print(f"[Launcher]   path: {model_path}")
+        # User passed explicit --model path(s). nargs='+' means it's a list.
+        if len(model_path) == 1:
+            model_path = model_path[0]
+            print(f"\n[Launcher] Using intent model (from --model): {model_path}")
         else:
-            print("\n[Launcher] No compatible intent model in models/. "
-                  "Running in rule-based mode.")
-            print("[Launcher] Train one with: "
-                  "python scripts/train_intent.py train --data data/*.json")
+            print(f"\n[Launcher] Using ensemble of {len(model_path)} checkpoints:")
+            for p in model_path:
+                print(f"  - {p}")
+    else:
+        ensemble = None if args.single_model else find_ensemble_models()
+        if ensemble:
+            print(f"\n[Launcher] Auto-detected ensemble "
+                  f"({len(ensemble)} fold checkpoints):")
+            for p in ensemble:
+                print(f"  - {Path(p).name}")
+            model_path = ensemble
+        else:
+            single = find_latest_model()
+            if single:
+                mb = Path(single).stat().st_size / 1e6
+                print(f"\n[Launcher] Loaded intent model: "
+                      f"{Path(single).name} ({mb:.1f} MB)")
+                print(f"[Launcher]   path: {single}")
+                model_path = single
+            else:
+                print("\n[Launcher] No compatible intent model in models/. "
+                      "Running in rule-based mode.")
+                print("[Launcher] Train one with: "
+                      "python scripts/train_intent.py train --data data/*.json")
 
     # 4. Banner
     print()
